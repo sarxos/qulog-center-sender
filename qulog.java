@@ -1,9 +1,19 @@
 ///usr/bin/env jbang "$0" "$@" ; exit $?
 
+//RUNTIME_OPTIONS --sun-misc-unsafe-memory-access=allow
+//RUNTIME_OPTIONS --enable-native-access=ALL-UNNAMED
+//RUNTIME_OPTIONS --add-opens=java.base/java.lang=ALL-UNNAMED
+//RUNTIME_OPTIONS -Dpolyglot.engine.WarnInterpreterOnly=false
+
 //DEPS info.picocli:picocli:4.6.3
+//DEPS org.graalvm.polyglot:polyglot:25.0.1
+//DEPS org.graalvm.polyglot:js:25.0.1@pom
+//DEPS org.graalvm.js:js-language:25.0.1
+//DEPS tools.jackson.core:jackson-databind:3.0.2
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.time.temporal.ChronoUnit.SECONDS;
+import static java.util.function.Predicate.not;
 import static java.util.stream.Collectors.joining;
 
 import java.io.BufferedReader;
@@ -11,19 +21,27 @@ import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.FileReader;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.NetworkInterface;
 import java.net.Socket;
 import java.net.SocketException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.stream.IntStream;
 import java.util.zip.CRC32;
+
+import org.graalvm.polyglot.Context;
+import org.graalvm.polyglot.Value;
 
 import picocli.CommandLine;
 import picocli.CommandLine.Command;
@@ -34,6 +52,7 @@ import picocli.CommandLine.Parameters;
 import picocli.CommandLine.ParentCommand;
 import picocli.CommandLine.ParseResult;
 import picocli.CommandLine.ScopeType;
+import tools.jackson.databind.ObjectMapper;
 
 
 /**
@@ -47,11 +66,13 @@ import picocli.CommandLine.ScopeType;
 	description = "Sends logs to QNAP NAS QuLog Center via TCP.",
 	mixinStandardHelpOptions = true,
 	subcommands = {
-		qulog.Test.class
+		qulog.Test.class,
+		qulog.Journal.class,
 	})
 class qulog implements Callable<Integer> {
 
 	private static final IExecutionStrategy LAST_CMD = new CommandLine.RunLast();
+	private static final LogLevelConverter LOG_LEVEL_CONVERTER = new LogLevelConverter();
 
 	private static final File FILE_HOSTNAME = new File("/proc/sys/kernel/hostname");
 
@@ -98,7 +119,7 @@ class qulog implements Callable<Integer> {
 	private String optHost;
 
 	@Option(
-		names = { "-p", "--port" },
+		names = { "-P", "--port" },
 		defaultValue = DEFAULT_QULOG_PORT,
 		description = """
 			NUmber of the TCP port where QuLog Center Log
@@ -148,11 +169,164 @@ class qulog implements Callable<Integer> {
 		return 0;
 	}
 
-	@Command(name = "test", description = "Send test log entry to QuLog Center.")
+	@Command(
+		name = "journal",
+		description = """
+			Processes JSON-formatted events from journald with supplied rules
+			file and sends events that match specific criteria to the remote
+			QuLog Center.""")
+	static class Journal implements Runnable {
+
+		private static final String RULES_LANG = "js";
+		private static final ObjectMapper MAPPER = new ObjectMapper();
+
+		@ParentCommand
+		private qulog parent;
+
+		@Option(
+			names = { "-r", "--rules" },
+			description = "Path to rules file.",
+			required = true,
+			paramLabel = "<file>")
+		private Path rulesFilePath;
+
+		private String rulesCode = "";
+		private long rulesLastModifiedTime = -1;
+
+		@Override
+		public void run() {
+
+			var line = "";
+
+			try (
+				final var context = createRulesContext();
+				final var reader = new BufferedReader(new InputStreamReader(System.in));) {
+
+				while ((line = reader.readLine()) != null) {
+					process(line, context);
+				}
+
+			} catch (IOException e) {
+				throw new RuntimeException(e);
+			}
+		}
+
+		@SuppressWarnings("serial")
+		private static class NoApplicationRuleResponseException extends RuntimeException {
+			public NoApplicationRuleResponseException() {
+				super("Resulting log entry is missing 'application' member");
+			}
+		}
+
+		@SuppressWarnings("serial")
+		private static class NoMessageException extends RuntimeException {
+			public NoMessageException() {
+				super("Journal log entry is missing 'MESSAGE' field");
+			}
+		}
+
+		private void process(final String line, final Context context) throws IOException {
+
+			final var json = parse(line);
+
+			if (json == null) {
+				System.out.println("Skipping invalid journal entry: " + line);
+				return;
+			}
+
+			final var message = Optional
+				.ofNullable(json.get("MESSAGE"))
+				.map(Object::toString)
+				.orElseThrow(NoMessageException::new);
+
+			final var modTime = Files
+				.getLastModifiedTime(rulesFilePath)
+				.toMillis();
+
+			if (modTime != rulesLastModifiedTime) {
+
+				rulesCode = Files.readString(rulesFilePath);
+				rulesLastModifiedTime = modTime;
+
+				context.eval(org.graalvm.polyglot.Source.newBuilder(
+					"js", rulesCode,
+					rulesFilePath.getFileName().toString())
+					.build());
+
+				System.out.println("Loaded updated rules file: " + rulesFilePath);
+			}
+
+			context
+				.getBindings(RULES_LANG)
+				.putMember("$LOG", json);
+
+			Value rules = context.getBindings("js").getMember("rules");
+
+			final var result = rules.execute();
+
+			if (result == null || !result.hasMembers()) {
+				return; // no action
+			}
+
+			final var resultApp = getMember(result, "application").orElseThrow(NoApplicationRuleResponseException::new);
+			final var resultCategory = getMember(result, "category").orElse("General Category");
+			final var resultLevel = getMember(result, "level")
+				.map(LOG_LEVEL_CONVERTER::convert)
+				.orElse(LogLevel.INFO);
+
+			final var address = parent.quLogSecketAddress;
+
+			final var level = resultLevel;
+			final var datetime = getDateTime();
+			final var source = parent.source;
+			final var application = new Application(resultApp, "someprocess");
+			final var category = new Category(resultCategory);
+			final var messageId = UUID.randomUUID();
+			final var user = System.getProperty("user.name");
+
+			final var sd = new StructuredData(source, application, category, user, messageId);
+			final var entry = new LogEntry(level, datetime, source, application, sd, message, messageId);
+
+			try {
+				sendLogEntry(entry, address);
+			} catch (IOException e) {
+				throw new RuntimeException(e);
+			}
+		}
+
+		private Optional<String> getMember(final Value value, final String member) {
+
+			return Optional
+				.ofNullable(value.getMember(member))
+				.map(Value::asString)
+				.filter(not(Objects::isNull))
+				.filter(not(String::isEmpty));
+		}
+
+		@SuppressWarnings("unchecked")
+		private Map<String, Object> parse(final String line) {
+			try {
+				return MAPPER.readValue(line, Map.class);
+			} catch (Exception e) {
+				return null; // silently ignore all parsing errors
+			}
+		}
+
+		private static Context createRulesContext() {
+			return Context
+				.newBuilder()
+				.allowAllAccess(true)
+				.build();
+		}
+	}
+
+	@Command(
+		name = "test",
+		description = "Send test log entry to QuLog Center.")
 	static class Test implements Runnable {
 
 		@ParentCommand
-		qulog parent;
+		private qulog parent;
 
 		@Option(
 			names = { "-a", "--application" },
@@ -162,6 +336,15 @@ class qulog implements Callable<Integer> {
 				Application name the log comes from, e.g. "Drupal",
 				"Portainer", "systemd", etc.""")
 		private String optApplicationName;
+
+		@Option(
+			names = { "-n", "--process-name" },
+			required = true,
+			paramLabel = "<name>",
+			description = """
+				Process name the log comes from, e.g. "drupal.php",
+				"portainer.sh", "systemd", etc.""")
+		private String optProcessName;
 
 		@Option(
 			names = { "-c", "--category" },
@@ -192,7 +375,7 @@ class qulog implements Callable<Integer> {
 			final var level = optLogLevel;
 			final var datetime = getDateTime();
 			final var source = parent.source;
-			final var application = new Application(optApplicationName);
+			final var application = new Application(optApplicationName, optProcessName);
 			final var category = new Category(optCategoryName);
 			final var messageId = UUID.randomUUID();
 			final var user = System.getProperty("user.name");
@@ -214,7 +397,11 @@ class qulog implements Callable<Integer> {
 
 	private static void sendLogEntry(final LogEntry entry, final InetSocketAddress address) throws IOException {
 
-		final var data = entry.toString().getBytes(UTF_8);
+		final var payload = entry.toString();
+
+		System.out.println("Payload: " + payload);
+
+		final var data = payload.getBytes(UTF_8);
 
 		try (final var socket = new Socket()) {
 
@@ -309,14 +496,15 @@ class qulog implements Callable<Integer> {
 	record Application(
 		String name,
 		String id,
-		long pid) {
+		String procName,
+		long procId) {
 
-		Application(final String name) {
-			this(name, ProcessHandle.current().pid());
+		Application(final String name, final String procName) {
+			this(name, procName, ProcessHandle.current().pid());
 		}
 
-		Application(final String name, final long pid) {
-			this(name, QL_SD_APP_ID_PREFIX + getShortId(name), pid);
+		Application(final String name, final String procName, final long procId) {
+			this(name, QL_SD_APP_ID_PREFIX + getShortId(name), procName, procId);
 		}
 	}
 
@@ -382,7 +570,8 @@ class qulog implements Callable<Integer> {
 		int version,
 		OffsetDateTime datetime,
 		String hostname,
-		String application,
+		String applicationName,
+		String processName,
 		long processId,
 		String message,
 		UUID messageId,
@@ -399,7 +588,9 @@ class qulog implements Callable<Integer> {
 			final String msg,
 			final UUID msgId) {
 
-			this(level.pri, VERSION, trunc(datetime), local.hostname(), app.name(), app.pid(), msg, msgId, sd);
+			this(level.pri, VERSION, trunc(datetime), local.hostname(), app.name(),
+				app.procName(),
+				app.procId(), msg, msgId, sd);
 		}
 
 		/**
@@ -420,8 +611,8 @@ class qulog implements Callable<Integer> {
 				<{pri}>{version} \
 				{timestamp} \
 				{hostname} \
-				{app_name} \
-				{app_pid} \
+				{proc_name} \
+				{proc_id} \
 				{msg_id} \
 				{sd} \
 				{message}\n""";
@@ -431,8 +622,8 @@ class qulog implements Callable<Integer> {
 				.replace("{version}", Integer.toString(version))
 				.replace("{timestamp}", datetime.toString())
 				.replace("{hostname}", hostname)
-				.replace("{app_name}", application)
-				.replace("{app_pid}", Long.toString(processId))
+				.replace("{proc_name}", processName)
+				.replace("{proc_id}", Long.toString(processId))
 				.replace("{msg_id}", messageId.toString())
 				.replace("{sd}", sd.toString())
 				.replace("{message}", message);
@@ -442,7 +633,7 @@ class qulog implements Callable<Integer> {
 	static class LogLevelConverter implements ITypeConverter<LogLevel> {
 
 		@Override
-		public LogLevel convert(final String value) throws Exception {
+		public LogLevel convert(final String value) {
 			return Optional.ofNullable(value)
 				.map(String::trim)
 				.map(String::toUpperCase)
