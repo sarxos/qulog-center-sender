@@ -1,9 +1,27 @@
 ///usr/bin/env jbang "$0" "$@" ; exit $?
 
+/**
+ * This script is an utility that can be used to forward logs from the
+ * joutnalctl to QuLog center running on QNAP NAS.
+ * 
+ * Usage example:
+ * 
+ * ./qulog.java test \
+ *   -s MySource -h qulog.my-nas.local \
+ *   -a MyApp -n myapp.sh -c "General Category" -l INFO "This is a test log message"
+ */
+
+// Below options are to disable all nasty warnings about unsafe memory access.
+
 //RUNTIME_OPTIONS --sun-misc-unsafe-memory-access=allow
 //RUNTIME_OPTIONS --enable-native-access=ALL-UNNAMED
 //RUNTIME_OPTIONS --add-opens=java.base/java.lang=ALL-UNNAMED
 //RUNTIME_OPTIONS -Dpolyglot.engine.WarnInterpreterOnly=false
+
+// Dependencies are minimal:
+// - picocli - to gave nice command line interface
+// - graalvm polyglot - to run JS rules for journal processing
+// - jackson-databind - to parse JSON journal entries
 
 //DEPS info.picocli:picocli:4.6.3
 //DEPS org.graalvm.polyglot:polyglot:25.0.1
@@ -13,6 +31,7 @@
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.time.temporal.ChronoUnit.SECONDS;
+import static java.util.Collections.emptyMap;
 import static java.util.function.Predicate.not;
 import static java.util.stream.Collectors.joining;
 
@@ -21,6 +40,7 @@ import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.FileReader;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -29,9 +49,11 @@ import java.net.Socket;
 import java.net.SocketException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -41,6 +63,7 @@ import java.util.stream.IntStream;
 import java.util.zip.CRC32;
 
 import org.graalvm.polyglot.Context;
+import org.graalvm.polyglot.Source;
 import org.graalvm.polyglot.Value;
 
 import picocli.CommandLine;
@@ -74,9 +97,12 @@ class qulog implements Callable<Integer> {
 	private static final IExecutionStrategy LAST_CMD = new CommandLine.RunLast();
 	private static final LogLevelConverter LOG_LEVEL_CONVERTER = new LogLevelConverter();
 
-	private static final File FILE_HOSTNAME = new File("/proc/sys/kernel/hostname");
+	/**
+	 * Read system hostname from here.
+	 */
+	private static final File HOSTNAME_FILE = new File("/proc/sys/kernel/hostname");
 
-	private static final String DEFAULT_QULOG_PORT = "1514";
+	private static final String DEFAULT_LOG_RECEIVER_PORT = "1514";
 
 	private static final String QL_SD_APP_ID_PREFIX = "QLSA-";
 	private static final String QL_SD_CAT_ID_PREFIX = "QLSC-";
@@ -120,7 +146,7 @@ class qulog implements Callable<Integer> {
 
 	@Option(
 		names = { "-P", "--port" },
-		defaultValue = DEFAULT_QULOG_PORT,
+		defaultValue = DEFAULT_LOG_RECEIVER_PORT,
 		description = """
 			NUmber of the TCP port where QuLog Center Log
 			Receiver is listening for incoming RFC 5424 syslog
@@ -133,7 +159,7 @@ class qulog implements Callable<Integer> {
 
 	private InetSocketAddress quLogSecketAddress;
 
-	private Source source;
+	private LogSource source;
 
 	void main(final String... args) {
 
@@ -177,8 +203,9 @@ class qulog implements Callable<Integer> {
 			QuLog Center.""")
 	static class Journal implements Runnable {
 
-		private static final String RULES_LANG = "js";
+		private static final String LANG = "js";
 		private static final ObjectMapper MAPPER = new ObjectMapper();
+		private static final UserIdMapper USER_ID_MAPPER = new UserIdMapper();
 
 		@ParentCommand
 		private qulog parent;
@@ -190,7 +217,6 @@ class qulog implements Callable<Integer> {
 			paramLabel = "<file>")
 		private Path rulesFilePath;
 
-		private String rulesCode = "";
 		private long rulesLastModifiedTime = -1;
 
 		@Override
@@ -199,10 +225,10 @@ class qulog implements Callable<Integer> {
 			var line = "";
 
 			try (
-				final var context = createRulesContext();
-				final var reader = new BufferedReader(new InputStreamReader(System.in));) {
+				final var context = newContext();
+				final var stdin = reader(System.in)) {
 
-				while ((line = reader.readLine()) != null) {
+				while ((line = stdin.readLine()) != null) {
 					process(line, context);
 				}
 
@@ -230,41 +256,20 @@ class qulog implements Callable<Integer> {
 			final var json = parse(line);
 
 			if (json == null) {
-				System.out.println("Skipping invalid journal entry: " + line);
 				return;
 			}
 
-			final var message = Optional
-				.ofNullable(json.get("MESSAGE"))
-				.map(Object::toString)
-				.orElseThrow(NoMessageException::new);
+			reloadContextIfNedded(context);
 
-			final var modTime = Files
-				.getLastModifiedTime(rulesFilePath)
-				.toMillis();
+			final var message = getJornalLogMessage(json);
+			final var bindings = context.getBindings(LANG);
 
-			if (modTime != rulesLastModifiedTime) {
+			bindings.putMember("$LOG", json);
 
-				rulesCode = Files.readString(rulesFilePath);
-				rulesLastModifiedTime = modTime;
+			final var filter = bindings.getMember("filter");
+			final var result = filter.execute();
 
-				context.eval(org.graalvm.polyglot.Source.newBuilder(
-					"js", rulesCode,
-					rulesFilePath.getFileName().toString())
-					.build());
-
-				System.out.println("Loaded updated rules file: " + rulesFilePath);
-			}
-
-			context
-				.getBindings(RULES_LANG)
-				.putMember("$LOG", json);
-
-			Value rules = context.getBindings("js").getMember("rules");
-
-			final var result = rules.execute();
-
-			if (result == null || !result.hasMembers()) {
+			if (result.isNull()) {
 				return; // no action
 			}
 
@@ -276,15 +281,18 @@ class qulog implements Callable<Integer> {
 
 			final var address = parent.quLogSecketAddress;
 
-			final var level = resultLevel;
-			final var datetime = getDateTime();
-			final var source = parent.source;
-			final var application = new Application(resultApp, "someprocess");
-			final var category = new Category(resultCategory);
-			final var messageId = UUID.randomUUID();
-			final var user = System.getProperty("user.name");
+			final var datetime = getEventDateTime(json);
+			final var processName = getProcessName(json);
+			final var processId = getProcessId(json);
+			final var userName = getUserName(json);
 
-			final var sd = new StructuredData(source, application, category, user, messageId);
+			final var level = resultLevel;
+			final var source = parent.source;
+			final var application = new LogApplication(resultApp, processName, processId);
+			final var category = new LogCategory(resultCategory);
+			final var messageId = UUID.randomUUID();
+
+			final var sd = new LogStructuredData(source, application, category, userName, messageId);
 			final var entry = new LogEntry(level, datetime, source, application, sd, message, messageId);
 
 			try {
@@ -294,13 +302,51 @@ class qulog implements Callable<Integer> {
 			}
 		}
 
+		private void reloadContextIfNedded(final Context context) throws IOException {
+
+			final var currModificationTime = getRulesFileModificationTime();
+			final var lastModificationTime = rulesLastModifiedTime;
+
+			if (currModificationTime == lastModificationTime) {
+				return;
+			}
+
+			rulesLastModifiedTime = currModificationTime;
+
+			final var file = rulesFilePath.toFile();
+			final var source = Source
+				.newBuilder(LANG, file)
+				.build();
+
+			context.eval(source);
+
+			System.out.println("Reloaded rules file: " + rulesFilePath);
+		}
+
+		private String getJornalLogMessage(final Map<String, Object> json) {
+			return Optional
+				.ofNullable(json.get("MESSAGE"))
+				.map(Object::toString)
+				.orElseThrow(NoMessageException::new);
+		}
+
 		private Optional<String> getMember(final Value value, final String member) {
+
+			if (!value.hasMember(member)) {
+				return Optional.empty();
+			}
 
 			return Optional
 				.ofNullable(value.getMember(member))
 				.map(Value::asString)
 				.filter(not(Objects::isNull))
 				.filter(not(String::isEmpty));
+		}
+
+		private long getRulesFileModificationTime() throws IOException {
+			return Files
+				.getLastModifiedTime(rulesFilePath)
+				.toMillis();
 		}
 
 		@SuppressWarnings("unchecked")
@@ -312,11 +358,36 @@ class qulog implements Callable<Integer> {
 			}
 		}
 
-		private static Context createRulesContext() {
+		private static Context newContext() {
 			return Context
 				.newBuilder()
 				.allowAllAccess(true)
 				.build();
+		}
+
+		static String getProcessName(final Map<String, Object> json) {
+			return Optional
+				.ofNullable(json.get("_COMM"))
+				.map(Object::toString)
+				.orElse("unknown");
+		}
+
+		static long getProcessId(final Map<String, Object> json) {
+			return Optional
+				.ofNullable(json.get("_PID"))
+				.map(Object::toString)
+				.map(Long::parseLong)
+				.orElse(0L);
+		}
+
+		static String getUserName(final Map<String, Object> json) throws SocketException {
+			return Optional
+				.ofNullable(json.get("_UID"))
+				.filter(not(Objects::isNull))
+				.map(Object::toString)
+				.map(Integer::parseInt)
+				.map(USER_ID_MAPPER::getUserName)
+				.orElse("unknown");
 		}
 	}
 
@@ -365,7 +436,7 @@ class qulog implements Callable<Integer> {
 		private LogLevel optLogLevel;
 
 		@Parameters(index = "0", description = "Log message to send")
-		String message;
+		private String parMessage;
 
 		@Override
 		public void run() {
@@ -373,15 +444,15 @@ class qulog implements Callable<Integer> {
 			final var address = parent.quLogSecketAddress;
 
 			final var level = optLogLevel;
-			final var datetime = getDateTime();
+			final var datetime = getEventDateTime();
 			final var source = parent.source;
-			final var application = new Application(optApplicationName, optProcessName);
-			final var category = new Category(optCategoryName);
+			final var application = new LogApplication(optApplicationName, optProcessName);
+			final var category = new LogCategory(optCategoryName);
 			final var messageId = UUID.randomUUID();
 			final var user = System.getProperty("user.name");
 
-			final var sd = new StructuredData(source, application, category, user, messageId);
-			final var entry = new LogEntry(level, datetime, source, application, sd, message, messageId);
+			final var sd = new LogStructuredData(source, application, category, user, messageId);
+			final var entry = new LogEntry(level, datetime, source, application, sd, parMessage, messageId);
 
 			try {
 				sendLogEntry(entry, address);
@@ -395,7 +466,39 @@ class qulog implements Callable<Integer> {
 		}
 	}
 
-	private static void sendLogEntry(final LogEntry entry, final InetSocketAddress address) throws IOException {
+	static class UserIdMapper {
+
+		private final Map<Integer, String> uidToUserMap = new HashMap<>();
+
+		public String getUserName(final int uid) {
+			return uidToUserMap.computeIfAbsent(uid, this::lookupUserName);
+		}
+
+		private String lookupUserName(final int uid) {
+
+			// Run process 'id -un {user-id}' to get user name by ID.
+
+			final var pb = new ProcessBuilder("id", "-un", Integer.toString(uid));
+			pb.redirectErrorStream(true);
+
+			try {
+				final var process = pb.start();
+				try (final var reader = reader(process.getInputStream())) {
+					final var line = reader.readLine();
+					process.waitFor();
+					return line != null ? line.trim() : "unknown";
+				}
+			} catch (IOException | InterruptedException e) {
+				return "unknown";
+			}
+		}
+	}
+
+	static BufferedReader reader(final InputStream is) {
+		return new BufferedReader(new InputStreamReader(is, UTF_8));
+	}
+
+	static void sendLogEntry(final LogEntry entry, final InetSocketAddress address) throws IOException {
 
 		final var payload = entry.toString();
 
@@ -414,11 +517,7 @@ class qulog implements Callable<Integer> {
 		}
 	}
 
-	private static InetSocketAddress getQuLogRemoteAddress(final String host, final int port) {
-		return new InetSocketAddress(host, port);
-	}
-
-	private Source getLocalAddressesFor(final String name, final InetSocketAddress remote) throws IOException {
+	private LogSource getLocalAddressesFor(final String name, final InetSocketAddress remote) throws IOException {
 
 		try (final var socket = new Socket()) {
 
@@ -435,15 +534,19 @@ class qulog implements Callable<Integer> {
 				.ofNullable(optMacAddress)
 				.orElse(getLocalMacAddressFrom(local));
 
-			return new Source(name, ip, mac, hostname);
+			return new LogSource(name, ip, mac, hostname);
 		}
 	}
 
-	private static String getLocalIpAddressFrom(final InetAddress local) throws IOException {
+	static InetSocketAddress getQuLogRemoteAddress(final String host, final int port) {
+		return new InetSocketAddress(host, port);
+	}
+
+	static String getLocalIpAddressFrom(final InetAddress local) throws IOException {
 		return local.getHostAddress();
 	}
 
-	private static String getLocalMacAddressFrom(final InetAddress local) throws SocketException {
+	static String getLocalMacAddressFrom(final InetAddress local) throws SocketException {
 
 		final var iface = NetworkInterface.getByInetAddress(local); // eth0, wlan0, etc
 		final var mac = iface.getHardwareAddress();
@@ -454,13 +557,13 @@ class qulog implements Callable<Integer> {
 			.collect(joining(":"));
 	}
 
-	private static String getLocalHostname() throws FileNotFoundException, IOException {
-		try (final var reader = new BufferedReader(new FileReader(FILE_HOSTNAME))) {
+	static String getLocalHostname() throws FileNotFoundException, IOException {
+		try (final var reader = new BufferedReader(new FileReader(HOSTNAME_FILE))) {
 			return reader.readLine(); // only line in file
 		}
 	}
 
-	private static String getShortId(final String string) {
+	static String getShortId(final String string) {
 
 		final var crc = new CRC32();
 
@@ -472,47 +575,66 @@ class qulog implements Callable<Integer> {
 		return base36.length() > 10 ? base36.substring(0, 10) : base36;
 	}
 
-	private static OffsetDateTime getDateTime() {
+	static OffsetDateTime getEventDateTime(final Map<String, Object> json) {
+
+		// The realtime timestamp from journal is in microseconds epoch time. We need to
+		// convert it to seconds epoch time.
+
+		final var micros = Optional
+			.ofNullable(json.get("__REALTIME_TIMESTAMP"))
+			.map(Object::toString)
+			.map(Long::parseLong)
+			.orElseGet(System::currentTimeMillis);
+
+		final long seconds = micros / 1_000_000;
 
 		final var now = OffsetDateTime.now();
-		final var truncated = now.truncatedTo(SECONDS);
+		final var instant = Instant.ofEpochSecond(seconds);
+		final var time = OffsetDateTime.ofInstant(instant, now.getOffset());
+		final var truncated = time.truncatedTo(SECONDS);
 
-		// We need truncated time without nanos as QuLog Center does not accept them.
+		// We need truncated time without nanos as QuLog Center does not accept them. Here
+		// we do not set nanos at all, but let's truncate just in case if we decide to add
+		// nanos later on.
 
 		return truncated;
 	}
 
-	record Source(
+	static OffsetDateTime getEventDateTime() {
+		return getEventDateTime(emptyMap());
+	}
+
+	record LogSource(
 		String name,
 		String ip,
 		String mac,
 		String hostname) {
 
-		Source {
+		LogSource {
 			mac = mac.toLowerCase();
 		}
 	}
 
-	record Application(
+	record LogApplication(
 		String name,
 		String id,
 		String procName,
 		long procId) {
 
-		Application(final String name, final String procName) {
+		LogApplication(final String name, final String procName) {
 			this(name, procName, ProcessHandle.current().pid());
 		}
 
-		Application(final String name, final String procName, final long procId) {
+		LogApplication(final String name, final String procName, final long procId) {
 			this(name, QL_SD_APP_ID_PREFIX + getShortId(name), procName, procId);
 		}
 	}
 
-	record Category(
+	record LogCategory(
 		String name,
 		String id) {
 
-		Category(final String name) {
+		LogCategory(final String name) {
 			this(name, QL_SD_CAT_ID_PREFIX + getShortId(name));
 		}
 	}
@@ -525,10 +647,10 @@ class qulog implements Callable<Integer> {
 	 * 
 	 * @see https://datatracker.ietf.org/doc/html/rfc5424#section-6.3
 	 */
-	record StructuredData(
-		Source source,
-		Application application,
-		Category category,
+	record LogStructuredData(
+		LogSource source,
+		LogApplication application,
+		LogCategory category,
 		String user,
 		UUID messageId) {
 
@@ -575,16 +697,16 @@ class qulog implements Callable<Integer> {
 		long processId,
 		String message,
 		UUID messageId,
-		StructuredData sd) {
+		LogStructuredData sd) {
 
 		static final int VERSION = 1;
 
 		LogEntry(
 			final LogLevel level,
 			final OffsetDateTime datetime,
-			final Source local,
-			final Application app,
-			final StructuredData sd,
+			final LogSource local,
+			final LogApplication app,
+			final LogStructuredData sd,
 			final String msg,
 			final UUID msgId) {
 
@@ -642,18 +764,34 @@ class qulog implements Callable<Integer> {
 		}
 	}
 
-	enum Facility {
+	/**
+	 * The log facility numerical codes as per RFC 5424. The facility code ranges between 0 and 23
+	 * but, unfortunately, QuLog Center Log Receiver seems to support only the "user-level" messages
+	 * facility. All log entries with a different facility code are silently discarded and will not
+	 * appear in QuLog Center.
+	 * 
+	 * @see https://datatracker.ietf.org/doc/html/rfc5424#section-6.2.1
+	 */
+	enum LogFacility {
 
 		USER_LEVEL(1);
 
 		final int code;
 
-		Facility(final int code) {
+		LogFacility(final int code) {
 			this.code = code;
 		}
 	}
 
-	enum Severity {
+	/**
+	 * The log severity levels as per RFC 5424. The severity code ranges from 0 (Emergency) to 7
+	 * (Debug). Unfortunately, QuLog Center Log Receiver seems to support only Informational (6),
+	 * Warning (4) and Error (3) levels. All log entries with a different severity level are
+	 * silently discarded and will not appear in QuLog Center.
+	 * 
+	 * @see https://datatracker.ietf.org/doc/html/rfc5424#section-6.2.1
+	 */
+	enum LogSeverity {
 
 		INFORMATIONAL(6),
 		WARNING(4),
@@ -661,26 +799,35 @@ class qulog implements Callable<Integer> {
 
 		final int code;
 
-		Severity(final int code) {
+		LogSeverity(final int code) {
 			this.code = code;
 		}
 	}
 
+	/**
+	 * Internal log levels combining facility and severity as per RFC 5424. This is used to compute
+	 * the final PRI value in the syslog message.
+	 * 
+	 * @see https://datatracker.ietf.org/doc/html/rfc5424#section-6.2.1
+	 */
 	enum LogLevel {
 
-		INFO(Facility.USER_LEVEL, Severity.INFORMATIONAL),
-		WARNING(Facility.USER_LEVEL, Severity.WARNING),
-		ERROR(Facility.USER_LEVEL, Severity.ERROR);
+		INFO(LogFacility.USER_LEVEL, LogSeverity.INFORMATIONAL),
+		WARNING(LogFacility.USER_LEVEL, LogSeverity.WARNING),
+		ERROR(LogFacility.USER_LEVEL, LogSeverity.ERROR);
 
 		final int pri;
 
-		LogLevel(final Facility facility, final Severity severity) {
+		LogLevel(final LogFacility facility, final LogSeverity severity) {
 			final var fac = facility.code;
 			final var sev = severity.code;
 			this.pri = fac * 8 + sev;
 		}
 	}
 
+	/**
+	 * Used by picocli to list log level candidates in CLI.
+	 */
 	@SuppressWarnings("serial")
 	static class LogLevelCandidates extends ArrayList<String> {
 		LogLevelCandidates() {
