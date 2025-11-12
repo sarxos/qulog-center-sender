@@ -481,10 +481,9 @@ class qulog implements Callable<Integer> {
 		}
 
 		private LogLevel getLogLevel(final Map<String, Object> json, final Value result) {
-			return Optional.ofNullable(optLogLevel)
-				.or(() -> getLogLevelFromResult(result))
+			return getLogLevelFromResult(result)
 				.or(() -> getLogLevelFromJournalPriority(json))
-				.orElse(LogLevel.INFO);
+				.orElse(optLogLevel);
 		}
 
 		private static Optional<LogLevel> getLogLevelFromResult(final Value result) {

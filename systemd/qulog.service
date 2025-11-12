@@ -1,0 +1,26 @@
+[Unit]
+Description=Syslog forwarder for QNAP QuLog Center
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/qulog-start.sh
+Environment=QULOG_CONFIG=/etc/qulog/qulog.cfg
+
+# restart on failure, try restarting 3 times with a 5 second delay,
+# and then give up if all restarts failed within a 2 minute window
+
+Restart=on-failure
+RestartSec=5
+StartLimitInterval=120
+StartLimitBurst=3
+
+User=qulog
+Group=qulog
+
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

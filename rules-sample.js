@@ -1,41 +1,46 @@
 
 const CAT_USER_ACCESS = "User Access";
+const CAT_SECURITY = "Security";
 const CAT_SERVICES = "Services";
 const CAT_MEMORY = "Memory";
- 
+
+const INFO = "info";
+const WARNING = "warning";
+const ERROR = "error";
+
 /**
  * Filtering function to categorize logs.
  */
 function filter() {
 
-  // use login and logout events.
+  // user login and logout events
 
   if (isUserLogin($LOG)) {
     return {
-      app: "Login Daemon",
-      cat: CAT_USER_ACCESS,
-      lvl: "info",
-      msg: "User " + $LOG.USER_ID + " logged in."
+      application: "Login Daemon",
+      category: CAT_USER_ACCESS,
+      level: INFO,
+      message: "User " + $LOG.USER_ID + " logged in.",
     };
   }
 
   if (isUserLogout($LOG)) {
     return {
-      app: "Login Daemon",
-      cat: CAT_USER_ACCESS,
-      lvl: "info",
-      msg: "User " + $LOG.USER_ID + " logged out."
+      application: "Login Daemon",
+      category: CAT_USER_ACCESS,
+      level: INFO,
+      message: "User " + $LOG.USER_ID + " logged out.",
     };
   }
 
-  // Start and stop of Nginx Proxy Manager via Docker Compose.
+  // start and stop of nginx proxy manager
 
   if (isNPMComposeStartup($LOG)) {
     return {
       application: "Nginx Proxy Manager",
       category: CAT_SERVICES,
-      level: "info",
-      message: "Nginx Proxy Manager started."
+      level: INFO,
+      message: "Nginx Proxy Manager started.",
     };
   }
 
@@ -43,8 +48,8 @@ function filter() {
     return {
       application: "Nginx Proxy Manager",
       category: CAT_SERVICES,
-      level: "info",
-      message: "Nginx Proxy Manager stopped."
+      level: INFO,
+      message: "Nginx Proxy Manager stopped.",
     };
   }
 
@@ -52,21 +57,43 @@ function filter() {
     return {
       application: "Nginx Proxy Manager",
       category: CAT_SERVICES,
-      level: "error",
-      message: "Nginx Proxy Manager startup failed!"
+      level: ERROR,
+      message: "Nginx Proxy Manager startup failed!",
+    };
+  }
+
+  // sudo command usage
+
+  if (isSudo($LOG)) {
+    const s = parseSudoMessage($LOG.MESSAGE);
+    return {
+      application: "Sudo",
+      category: CAT_USER_ACCESS,
+      level: WARNING,
+      message: `User ${s.caller} executed command as ${s.user}: ${s.cmd}`,
+    };
+  }
+
+  // ssh failed login attempts
+
+  if (isSSHFailedEvent($LOG)) {
+    return {
+      application: "SSH",
+      category: CAT_SECURITY,
+      level: ERROR,
     };
   }
 
   // Just for tests.
 
-  if ($LOG._COMM == "earlyoom") {
-    return {
-      application: "Early OOM",
-      category: CAT_MEMORY,
-      level: "warning",
-      message: "OOM mem stats: " + $LOG.MESSAGE
-    };
-  }
+  // if ($LOG._COMM == "earlyoom") {
+  //   return {
+  //     application: "Early OOM",
+  //     category: CAT_MEMORY,
+  //     level: "warning",
+  //     message: "OOM mem stats: " + $LOG.MESSAGE,
+  //   };
+  // }
 
   return null;
 }
@@ -119,4 +146,52 @@ function isNPMComposeEvent(log) {
   return log &&
     log._COMM == 'systemd' &&
     log.USER_UNIT == 'npm-compose.service';
+}
+
+/**
+ * Is log created by sudo command invocation.
+ */
+function isSudo(log) {
+  return log &&
+    log._COMM == 'sudo' &&
+    log._CMDLINE &&
+    log.MESSAGE.includes("TTY") &&
+    log.MESSAGE.includes("PWD") &&
+    log.MESSAGE.includes("USER") &&
+    log.MESSAGE.includes("COMMAND");
+}
+
+/**
+ * Extracts details from sudo MESSAGE field.
+ */
+function parseSudoMessage(message) {
+  const s = message.trim();
+  const regex = /^(\S+)\s*:\s*TTY=(\S+)\s*;\s*PWD=(\S+)\s*;\s*USER=(\S+)\s*;\s*COMMAND=(.+)$/
+  const [ , caller, tty, pwd, user, cmd ] = s.match(regex);
+  return { 
+    caller, // by whom sudo was called 
+    tty, // on which terminal
+    pwd, // in which directory
+    user, // which user sudo switched to
+    cmd // what command was executed
+  };
+}
+
+/**
+ * Is log created by ssh service.
+ */
+function isSSHEvent(log) {
+  return log &&
+    log._COMM == 'sshd-session' &&
+    log._SYSTEMD_UNIT == 'ssh.service';
+}
+
+/**
+ * Is it SSH failed login attempt.
+ */
+function isSSHFailedEvent(log) {
+  return isSSHEvent(log) && (
+    log.MESSAGE.startsWith("Invalid user") ||
+    log.MESSAGE.startsWith("Failed password") ||
+    log.MESSAGE.startsWith("Failed publickey"));
 }
