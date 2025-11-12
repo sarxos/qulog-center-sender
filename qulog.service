@@ -1,0 +1,19 @@
+[Unit]
+Description=QuLog syslog forwarder for QNAP QuLog Center
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash -c 'journalctl -o json -f | /usr/local/bin/qulog.java journal'
+Environment=QULOG_CONFIG=/etc/qulog/qulog.cfg
+Restart=on-failure
+RestartSec=5
+User=qulog
+Group=qulog
+StandardOutput=null
+StandardError=append:/var/log/qulog.err.log
+
+[Install]
+WantedBy=multi-user.target
+
