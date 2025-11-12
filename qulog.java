@@ -1,16 +1,5 @@
 ///usr/bin/env jbang "$0" "$@" ; exit $?
 
-/**
- * This script is an utility that can be used to forward logs from the
- * joutnalctl to QuLog center running on QNAP NAS.
- * 
- * Usage example:
- * 
- * ./qulog.java test \
- *   -s MySource -h qulog.my-nas.local \
- *   -a MyApp -n myapp.sh -c "General Category" -l INFO "This is a test log message"
- */
-
 // Below options are to disable all nasty warnings about unsafe memory access.
 
 //RUNTIME_OPTIONS --sun-misc-unsafe-memory-access=allow
@@ -37,6 +26,7 @@ import static java.util.stream.Collectors.joining;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.FileReader;
 import java.io.IOException;
@@ -50,13 +40,15 @@ import java.net.SocketException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
+import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Optional;
+import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.stream.IntStream;
@@ -68,8 +60,11 @@ import org.graalvm.polyglot.Value;
 
 import picocli.CommandLine;
 import picocli.CommandLine.Command;
+import picocli.CommandLine.IDefaultValueProvider;
 import picocli.CommandLine.IExecutionStrategy;
 import picocli.CommandLine.ITypeConverter;
+import picocli.CommandLine.Model.ArgSpec;
+import picocli.CommandLine.Model.OptionSpec;
 import picocli.CommandLine.Option;
 import picocli.CommandLine.Parameters;
 import picocli.CommandLine.ParentCommand;
@@ -87,15 +82,17 @@ import tools.jackson.databind.ObjectMapper;
 	name = "qulog",
 	version = "qulog 0.1",
 	description = "Sends logs to QNAP NAS QuLog Center via TCP.",
+	defaultValueProvider = ConfigFileDefaultValueProvider.class,
 	mixinStandardHelpOptions = true,
+	sortOptions = false,
 	subcommands = {
-		qulog.Test.class,
-		qulog.Journal.class,
+		qulog.test.class,
+		qulog.journal.class,
 	})
 class qulog implements Callable<Integer> {
 
 	private static final IExecutionStrategy LAST_CMD = new CommandLine.RunLast();
-	private static final LogLevelConverter LOG_LEVEL_CONVERTER = new LogLevelConverter();
+	private static final DateTimeFormatter VERBOSE_DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
 	/**
 	 * Read system hostname from here.
@@ -112,48 +109,95 @@ class qulog implements Callable<Integer> {
 	// CLI args
 
 	@Option(
+		order = 1,
 		names = { "-s", "--source" },
 		required = true,
-		description = "Source name to display in QuLog Center.",
+		description = """
+			A source name to display under the QuLog Service in
+			the Sender Devices section. This name should be the
+			primary grouping mechanism that can help us to find
+			from which device logs are coming from. Please make
+			sure the name is short but descriptive enough. This
+			option is mandatory or the script will not run. The
+			example source name: "Home LAN Server", "The Office
+			Surveillance", "Minecraft Server", etc.%n""",
 		paramLabel = "<name>",
 		scope = ScopeType.INHERIT)
 	private String optSourceName;
 
 	@Option(
-		names = { "--source-mac-address" },
-		description = "Source MAC address to display in QuLog Center.",
-		paramLabel = "<mac-address>",
+		order = 2,
+		names = { "--mac" },
+		description = """
+			Optional MAC address of the source device. This can
+			be useed when device has multiple interfaces. QuLog
+			Center uses MAC address to uniquely identify device
+			in the Sender Devices list. When multiple addresses
+			are used with the same sender name, the devices are
+			merged into one, which is not desired. When address
+			is not provided, it is automatically detected based
+			on the network interface used to connect to a QuLog
+			Center Log Receiver. The format of the address must
+			be XX:XX:XX:XX:XX:XX (hexadecimal) where X is a hex
+			digit (0-9, A-F).%n""",
+		paramLabel = "<mac>",
 		scope = ScopeType.INHERIT)
 	private String optMacAddress;
 
 	@Option(
-		names = { "--source-hostname" },
-		description = "Source hostname to display in QuLog Center.",
+		order = 3,
+		names = { "--hostname" },
+		description = """
+			Optional source hostname to use when sending syslog
+			messages to the QuLog Center Log Receiver. When not
+			provided, the local system hostname is used instead
+			(read from /proc/sys/kernel/hostname file).%n""",
 		paramLabel = "<hostname>",
 		scope = ScopeType.INHERIT)
 	private String optHostname;
 
 	@Option(
+		order = 4,
 		names = { "-h", "--host" },
 		required = true,
 		description = """
-			Remote address (domain or IP) where QuLog Center
-			Log Receiver is configured to listen for incoming
-			RFC 5424 syslog messages.""",
+			Remote address (can be domain or IP) that points to
+			where syslog messages will be delivered. Important:
+			the Log Receiver in QuLog Center must be configured
+			to listen for incoming syslog messages on this host
+			address. The transfer protocol in Log Receiver must
+			be set to TCP. This option is mandatory.%n""",
 		paramLabel = "<address>",
 		scope = ScopeType.INHERIT)
 	private String optHost;
 
 	@Option(
-		names = { "-P", "--port" },
+		order = 5,
+		names = { "-p", "--port" },
 		defaultValue = DEFAULT_LOG_RECEIVER_PORT,
 		description = """
-			NUmber of the TCP port where QuLog Center Log
-			Receiver is listening for incoming RFC 5424 syslog
-			messages (default ${DEFAULT-VALUE} if not provided) otherwise.""",
+			Remote port on the QNAP host where Log Receiver has
+			been configured to listen for incoming traffic. The
+			default port for QuLog Center Log Receiver is 1514.
+			Provide port number only if a different port should
+			be used. This option is optional. Log Receiver must
+			be configured with TCP port as this script uses the
+			TCP only as more reliable option over UDB. When the
+			port is not provided, default of ${DEFAULT-VALUE} is used.%n""",
 		paramLabel = "<port>",
 		scope = ScopeType.INHERIT)
 	private Integer optPort;
+
+	@Option(
+		order = 6,
+		names = { "-v", "--verbose" },
+		description = """
+			---------------------------------------------------
+			Verbose mode. When enabled, the script will print a
+			lot of debug informations to STDOUT to troubleshoot
+			the problem.%n""",
+		scope = ScopeType.INHERIT)
+	private boolean optVerbose;
 
 	// internal stuff
 
@@ -197,11 +241,20 @@ class qulog implements Callable<Integer> {
 
 	@Command(
 		name = "journal",
+		header = "Filter and forward Journal logs to QuLog Center.",
+		sortOptions = false,
+		descriptionHeading = "%nDescription:%n%n",
 		description = """
-			Processes JSON-formatted events from journald with supplied rules
-			file and sends events that match specific criteria to the remote
-			QuLog Center.""")
-	static class Journal implements Runnable {
+			Consume JSON-formatted Journal log entries from STDIN stream, push them to rules
+			script to be filtered and categorized, and send filtered log entries with proper
+			structured data to the QuLog Center Log Receiver. Log entries that did not match
+			any rule are silently ignored. If the rules file is being modified while command
+			is running working, the rules are being reloaded and applied to next log entries
+			automatically. When a JSON entry from Journal output cannot be parsed due to any
+			reason, it is silently skipped.
+			--------------------------------------------------------------------------------%n""",
+		defaultValueProvider = ConfigFileDefaultValueProvider.class)
+	static class journal implements Runnable {
 
 		private static final String LANG = "js";
 		private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -211,57 +264,103 @@ class qulog implements Callable<Integer> {
 		private qulog parent;
 
 		@Option(
+			order = 10,
 			names = { "-r", "--rules" },
-			description = "Path to rules file.",
+			paramLabel = "<file-path>",
 			required = true,
-			paramLabel = "<file>")
+			description = """
+				Path to JS file with filter function. This file can
+				be in any directory as long as the path is correct.
+				The JS file must define no-argument function called
+				a 'filter'. This function will be invoked to filter
+				every journal log entry from STDIN. It's mandatory.%n""")
 		private Path rulesFilePath;
 
+		@Option(
+			order = 11,
+			names = { "--user" },
+			paramLabel = "<name>",
+			description = """
+				Optional user name to be used for every entry we do
+				send to the Log Receiver. When this option is used,
+				all the events received with QuLog Center will show
+				this user name instead of the actual user name from
+				the journal log entry. It has precedence over names
+				derived from rules execution.%n""")
+		private String optUserName;
+
+		@Option(
+			order = 12,
+			names = { "--application" },
+			paramLabel = "<name>",
+			description = """
+				Optional application name to use for every log that
+				is being send to the Log Receiver. When this option
+				is set, all the events received by the QuLog Center
+				will be reported from this application name instead
+				of an actual application from journal log entry. It
+				has precedence over application names obtained from
+				rules execution.%n""")
+		private String optApplicationName;
+
+		@Option(
+			order = 13,
+			names = { "--category" },
+			paramLabel = "<name>",
+			description = """
+				Optional category name to use for every log entries
+				sent to the Log Receiver. When this option is used,
+				all the events received by the QuLog Center will be
+				reported with this categoryname instead of the name
+				from rules execution.%n""")
+		private String optCategoryName;
+
+		@Option(
+			order = 14,
+			names = { "--level" },
+			paramLabel = "<level>",
+			defaultValue = "INFO",
+			description = """
+				Optional log level to be used for all the logs that
+				are being send to the Log Receiver. This option has
+				a precedence over value returned by rules. Possible
+				values are: ${COMPLETION-CANDIDATES}.%n""",
+			converter = LogLevelConverter.class,
+			completionCandidates = LogLevelCandidates.class)
+		private LogLevel optLogLevel;
+
 		private long rulesLastModifiedTime = -1;
+		private Context context = newContext();
 
 		@Override
 		public void run() {
 
 			var line = "";
 
-			try (
-				final var context = newContext();
-				final var stdin = reader(System.in)) {
-
+			try (final var stdin = reader(System.in)) {
 				while ((line = stdin.readLine()) != null) {
-					process(line, context);
+					process(line);
 				}
-
 			} catch (IOException e) {
 				throw new RuntimeException(e);
+			} finally {
+				if (context != null) {
+					context.close();
+				}
 			}
 		}
 
-		@SuppressWarnings("serial")
-		private static class NoApplicationRuleResponseException extends RuntimeException {
-			public NoApplicationRuleResponseException() {
-				super("Resulting log entry is missing 'application' member");
-			}
-		}
-
-		@SuppressWarnings("serial")
-		private static class NoMessageException extends RuntimeException {
-			public NoMessageException() {
-				super("Journal log entry is missing 'MESSAGE' field");
-			}
-		}
-
-		private void process(final String line, final Context context) throws IOException {
+		private void process(final String line) throws IOException {
 
 			final var json = parse(line);
+			final var message = getJornalLogMessage(json);
 
-			if (json == null) {
+			if (message == null) {
 				return;
 			}
 
-			reloadContextIfNedded(context);
+			reloadContextIfNedded();
 
-			final var message = getJornalLogMessage(json);
 			final var bindings = context.getBindings(LANG);
 
 			bindings.putMember("$LOG", json);
@@ -273,36 +372,34 @@ class qulog implements Callable<Integer> {
 				return; // no action
 			}
 
-			final var resultApp = getMember(result, "application").orElseThrow(NoApplicationRuleResponseException::new);
-			final var resultCategory = getMember(result, "category").orElse("General Category");
-			final var resultLevel = getMember(result, "level")
-				.map(LOG_LEVEL_CONVERTER::convert)
-				.orElse(LogLevel.INFO);
+			final var resultApplication = getApplication(json, result);
+			final var resultCategory = getCategory(result);
+			final var resultMessage = getMessage(message, result);
 
 			final var address = parent.quLogSecketAddress;
 
 			final var datetime = getEventDateTime(json);
 			final var processName = getProcessName(json);
 			final var processId = getProcessId(json);
-			final var userName = getUserName(json);
+			final var userName = getUserName(json, result);
+			final var logLevel = getLogLevel(json, result);
 
-			final var level = resultLevel;
 			final var source = parent.source;
-			final var application = new LogApplication(resultApp, processName, processId);
+			final var application = new LogApplication(resultApplication, processName, processId);
 			final var category = new LogCategory(resultCategory);
 			final var messageId = UUID.randomUUID();
 
 			final var sd = new LogStructuredData(source, application, category, userName, messageId);
-			final var entry = new LogEntry(level, datetime, source, application, sd, message, messageId);
+			final var entry = new LogEntry(logLevel, datetime, source, application, sd, resultMessage, messageId);
 
 			try {
-				sendLogEntry(entry, address);
+				parent.send(entry, address);
 			} catch (IOException e) {
 				throw new RuntimeException(e);
 			}
 		}
 
-		private void reloadContextIfNedded(final Context context) throws IOException {
+		private void reloadContextIfNedded() throws IOException {
 
 			final var currModificationTime = getRulesFileModificationTime();
 			final var lastModificationTime = rulesLastModifiedTime;
@@ -318,29 +415,109 @@ class qulog implements Callable<Integer> {
 				.newBuilder(LANG, file)
 				.build();
 
-			context.eval(source);
-
-			System.out.println("Reloaded rules file: " + rulesFilePath);
-		}
-
-		private String getJornalLogMessage(final Map<String, Object> json) {
-			return Optional
-				.ofNullable(json.get("MESSAGE"))
-				.map(Object::toString)
-				.orElseThrow(NoMessageException::new);
-		}
-
-		private Optional<String> getMember(final Value value, final String member) {
-
-			if (!value.hasMember(member)) {
-				return Optional.empty();
+			if (context != null) {
+				context.close();
 			}
 
+			context = newContext();
+			context.eval(source);
+
+			parent.log(this, "Loaded rules file " + rulesFilePath);
+		}
+
+		private static String getMessage(final String journalMessage, final Value result) {
+			return getMember(result, "message")
+				.or(() -> getMember(result, "msg"))
+				.or(() -> getMember(result, "m"))
+				.map(String::trim)
+				.filter(not(String::isEmpty))
+				.orElse(journalMessage);
+		}
+
+		private static String getJornalLogMessage(final Map<String, Object> json) {
+			return Optional.ofNullable(json)
+				.map(map -> map.get("MESSAGE"))
+				.map(Object::toString)
+				.map(String::trim)
+				.orElse(null);
+		}
+
+		private String getApplication(final Map<String, Object> json, final Value result) {
+			return Optional.ofNullable(optApplicationName)
+				.or(() -> getApplicationFromResult(result))
+				.or(() -> getApplicationFromJournalSyslogIdentifier(json))
+				.or(() -> getApplicationFromJournalComm(json))
+				.orElse("Unknown");
+		}
+
+		private static Optional<String> getApplicationFromResult(final Value result) {
+			return getMember(result, "application")
+				.or(() -> getMember(result, "app"))
+				.or(() -> getMember(result, "a"));
+		}
+
+		private static Optional<String> getApplicationFromJournalSyslogIdentifier(final Map<String, Object> json) {
 			return Optional
-				.ofNullable(value.getMember(member))
-				.map(Value::asString)
-				.filter(not(Objects::isNull))
-				.filter(not(String::isEmpty));
+				.ofNullable(json.get("SYSLOG_IDENTIFIER"))
+				.map(Object::toString);
+		}
+
+		private static Optional<String> getApplicationFromJournalComm(final Map<String, Object> json) {
+			return Optional
+				.ofNullable(json.get("_COMM"))
+				.map(Object::toString);
+		}
+
+		private String getCategory(final Value result) {
+			return Optional.ofNullable(optCategoryName)
+				.or(() -> getCategoryFromResult(result))
+				.orElse("General Events");
+		}
+
+		private static Optional<String> getCategoryFromResult(final Value result) {
+			return getMember(result, "category")
+				.or(() -> getMember(result, "cat"))
+				.or(() -> getMember(result, "c"));
+		}
+
+		private LogLevel getLogLevel(final Map<String, Object> json, final Value result) {
+			return Optional.ofNullable(optLogLevel)
+				.or(() -> getLogLevelFromResult(result))
+				.or(() -> getLogLevelFromJournalPriority(json))
+				.orElse(LogLevel.INFO);
+		}
+
+		private static Optional<LogLevel> getLogLevelFromResult(final Value result) {
+			return getMember(result, "level")
+				.or(() -> getMember(result, "lvl"))
+				.or(() -> getMember(result, "l"))
+				.map(String::toUpperCase)
+				.map(LogLevel::valueOf);
+		}
+
+		private static Optional<LogLevel> getLogLevelFromJournalPriority(final Map<String, Object> json) {
+			return Optional
+				.ofNullable(json.get("PRIORITY"))
+				.map(Object::toString)
+				.map(Integer::parseInt)
+				.map(prio -> switch (prio) {
+					case 0, 1, 2, 3 -> LogLevel.ERROR;
+					case 4, 5 -> LogLevel.WARNING;
+					case 6, 7 -> LogLevel.INFO;
+					default -> LogLevel.INFO;
+				});
+		}
+
+		private static Optional<String> getMember(final Value value, final String member) {
+			if (value.hasMember(member)) {
+				return Optional
+					.ofNullable(value.getMember(member))
+					.filter(not(Value::isNull))
+					.map(Value::asString)
+					.filter(not(String::isEmpty));
+			} else {
+				return Optional.empty();
+			}
 		}
 
 		private long getRulesFileModificationTime() throws IOException {
@@ -350,7 +527,7 @@ class qulog implements Callable<Integer> {
 		}
 
 		@SuppressWarnings("unchecked")
-		private Map<String, Object> parse(final String line) {
+		private static Map<String, Object> parse(final String line) {
 			try {
 				return MAPPER.readValue(line, Map.class);
 			} catch (Exception e) {
@@ -365,14 +542,14 @@ class qulog implements Callable<Integer> {
 				.build();
 		}
 
-		static String getProcessName(final Map<String, Object> json) {
+		private static String getProcessName(final Map<String, Object> json) {
 			return Optional
 				.ofNullable(json.get("_COMM"))
 				.map(Object::toString)
 				.orElse("unknown");
 		}
 
-		static long getProcessId(final Map<String, Object> json) {
+		private static long getProcessId(final Map<String, Object> json) {
 			return Optional
 				.ofNullable(json.get("_PID"))
 				.map(Object::toString)
@@ -380,26 +557,47 @@ class qulog implements Callable<Integer> {
 				.orElse(0L);
 		}
 
-		static String getUserName(final Map<String, Object> json) throws SocketException {
+		private String getUserName(final Map<String, Object> json, final Value result) {
+			return Optional.ofNullable(optUserName)
+				.or(() -> getUserNameFromResult(result))
+				.or(() -> getUserNameFromUserId(json))
+				.or(() -> getUserNamFromUid(json))
+				.orElse("unknown");
+		}
+
+		private static Optional<String> getUserNameFromResult(final Value result) {
+			return getMember(result, "user")
+				.or(() -> getMember(result, "usr"))
+				.or(() -> getMember(result, "u"));
+		}
+
+		private static Optional<String> getUserNameFromUserId(final Map<String, Object> json) {
+			return Optional
+				.ofNullable(json.get("USER_ID"))
+				.map(Object::toString);
+		}
+
+		private static Optional<String> getUserNamFromUid(final Map<String, Object> json) {
 			return Optional
 				.ofNullable(json.get("_UID"))
-				.filter(not(Objects::isNull))
 				.map(Object::toString)
 				.map(Integer::parseInt)
-				.map(USER_ID_MAPPER::getUserName)
-				.orElse("unknown");
+				.map(USER_ID_MAPPER::getUserName);
 		}
 	}
 
 	@Command(
 		name = "test",
+		sortOptions = false,
+		header = "Send test log entry to QuLog Center.",
 		description = "Send test log entry to QuLog Center.")
-	static class Test implements Runnable {
+	static class test implements Runnable {
 
 		@ParentCommand
 		private qulog parent;
 
 		@Option(
+			order = 10,
 			names = { "-a", "--application" },
 			required = true,
 			paramLabel = "<name>",
@@ -409,6 +607,7 @@ class qulog implements Callable<Integer> {
 		private String optApplicationName;
 
 		@Option(
+			order = 11,
 			names = { "-n", "--process-name" },
 			required = true,
 			paramLabel = "<name>",
@@ -418,6 +617,7 @@ class qulog implements Callable<Integer> {
 		private String optProcessName;
 
 		@Option(
+			order = 12,
 			names = { "-c", "--category" },
 			required = true,
 			paramLabel = "<name>",
@@ -427,6 +627,7 @@ class qulog implements Callable<Integer> {
 		private String optCategoryName;
 
 		@Option(
+			order = 13,
 			names = { "-l", "--level" },
 			defaultValue = "INFO",
 			description = "Log level: ${COMPLETION-CANDIDATES}.",
@@ -455,14 +656,14 @@ class qulog implements Callable<Integer> {
 			final var entry = new LogEntry(level, datetime, source, application, sd, parMessage, messageId);
 
 			try {
-				sendLogEntry(entry, address);
+				parent.send(entry, address);
 			} catch (IOException e) {
 				throw new RuntimeException(e);
 			}
 
-			System.out.println("Sending log entry: " + entry);
-			System.out.println("From: " + source.name() + " " + source.hostname() + "/" + source.ip() + " (" + source.mac() + ")");
-			System.out.println("To: " + parent.quLogSecketAddress);
+			parent.log(this, "Sending log entry: " + entry);
+			parent.log(this, "From: " + source.name() + " " + source.hostname() + "/" + source.ip() + " (" + source.mac() + ")");
+			parent.log(this, "To: " + parent.quLogSecketAddress);
 		}
 	}
 
@@ -498,13 +699,12 @@ class qulog implements Callable<Integer> {
 		return new BufferedReader(new InputStreamReader(is, UTF_8));
 	}
 
-	static void sendLogEntry(final LogEntry entry, final InetSocketAddress address) throws IOException {
+	void send(final LogEntry entry, final InetSocketAddress address) throws IOException {
 
 		final var payload = entry.toString();
-
-		System.out.println("Payload: " + payload);
-
 		final var data = payload.getBytes(UTF_8);
+
+		log(this, "Sending syslog payload: " + payload);
 
 		try (final var socket = new Socket()) {
 
@@ -598,6 +798,18 @@ class qulog implements Callable<Integer> {
 		// nanos later on.
 
 		return truncated;
+	}
+
+	void log(final Object caller, final String message) {
+
+		if (!optVerbose) {
+			return;
+		}
+
+		final var date = VERBOSE_DATE_FORMAT.format(LocalDateTime.now());
+		final var clazz = caller.getClass().getSimpleName();
+
+		System.out.println(date + " [" + clazz + "] " + message);
 	}
 
 	static OffsetDateTime getEventDateTime() {
@@ -835,6 +1047,48 @@ class qulog implements Callable<Integer> {
 				.stream(LogLevel.values())
 				.map(Enum::name)
 				.toList());
+		}
+	}
+}
+
+class ConfigFileDefaultValueProvider implements IDefaultValueProvider {
+
+	private static final String CONFIG_ENV_VAR = "QULOG_CONFIG";
+	private static final String DEFAULT_CONFIG_PATH = "/etc/qulog/qulog.cfg";
+
+	private final Properties props = new Properties();
+
+	ConfigFileDefaultValueProvider() {
+
+		final var path = System
+			.getenv()
+			.getOrDefault(CONFIG_ENV_VAR, DEFAULT_CONFIG_PATH);
+
+		try (final var fis = new FileInputStream(path)) {
+			props.load(fis);
+		} catch (IOException ignored) {
+			// ignore
+		}
+	}
+
+	@Override
+	public String defaultValue(final ArgSpec arg) {
+
+		final var key = getKey(arg).replace("--", "");
+
+		final var value = Optional
+			.ofNullable(props.getProperty(key))
+			.map(String::trim)
+			.orElse(null);
+
+		return value;
+	}
+
+	private String getKey(final ArgSpec arg) {
+		if (arg instanceof OptionSpec option) {
+			return option.longestName();
+		} else {
+			return arg.paramLabel();
 		}
 	}
 }
