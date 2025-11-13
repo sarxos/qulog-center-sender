@@ -481,9 +481,10 @@ class qulog implements Callable<Integer> {
 		}
 
 		private LogLevel getLogLevel(final Map<String, Object> json, final Value result) {
-			return getLogLevelFromResult(result)
+			return Optional.of(optLogLevel)
+				.or(() -> getLogLevelFromResult(result))
 				.or(() -> getLogLevelFromJournalPriority(json))
-				.orElse(optLogLevel);
+				.orElse(LogLevel.INFO);
 		}
 
 		private static Optional<LogLevel> getLogLevelFromResult(final Value result) {
@@ -503,7 +504,7 @@ class qulog implements Callable<Integer> {
 					case 0, 1, 2, 3 -> LogLevel.ERROR;
 					case 4, 5 -> LogLevel.WARNING;
 					case 6, 7 -> LogLevel.INFO;
-					default -> LogLevel.INFO;
+					default -> null;
 				});
 		}
 
@@ -1050,10 +1051,12 @@ class qulog implements Callable<Integer> {
 	}
 }
 
+/**
+ * Loads default options from config file pointed by <code>QULOG_CONFIG</code> environment variable.
+ */
 class ConfigFileDefaultValueProvider implements IDefaultValueProvider {
 
 	private static final String CONFIG_ENV_VAR = "QULOG_CONFIG";
-	private static final String DEFAULT_CONFIG_PATH = "/etc/qulog/qulog.cfg";
 
 	private final Properties props = new Properties();
 
@@ -1061,7 +1064,11 @@ class ConfigFileDefaultValueProvider implements IDefaultValueProvider {
 
 		final var path = System
 			.getenv()
-			.getOrDefault(CONFIG_ENV_VAR, DEFAULT_CONFIG_PATH);
+			.get(CONFIG_ENV_VAR);
+
+		if (path == null || path.isBlank()) {
+			return; // do not load config file
+		}
 
 		try (final var fis = new FileInputStream(path)) {
 			props.load(fis);
