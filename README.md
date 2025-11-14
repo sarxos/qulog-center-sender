@@ -199,37 +199,18 @@ More advanced example with multiple rules, custom extraction functions and enric
 can be found in the `rules-sample.js` file included in this repository.
 
 There are some shortcuts available to make writing rules faster and more condensed. For example,
-the `application`, `category`, `message`, `level` and `user` properties can be abbreviated.
-
-Valid application property names:
-* `application`
-* `app`
-* `a`
-
-Valid category property names:
-* `category`
-* `cat`
-* `c`
-
-Valid message property names:
-* `message`
-* `msg`
-* `m`
-
-Valid level property names:
-* `level`
-* `lvl`
-* `l`
-
-Valid user property names:
-* `user`
-* `usr`
-* `u`
+the `application`, `category`, `message`, `level` and `user` properties can be abbreviated:
+* Application name: `application` → `app` → `a`.
+* Category name:* `category` → `cat` → `c`.
+* Message:* `message` → `msg` → `m`.
+* Log level: `level` → `lvl` → `l`.
+* User name: `user` → `usr` → `u`.
 
 So this:
 
 ```javascript
 return {
+  user: $LOG.USER_ID,
   application: "Logind Service",
   category: "User Access",
   message: "User " + $LOG.USER_ID + " logged in.",
@@ -237,10 +218,11 @@ return {
 };
 ```
 
-Will work exactly the same as this:
+Will work exactly the same as:
 
 ```javascript
 return {
+  u: $LOG.USER_ID,
   a: "Logind Service",
   c: "User Access",
   m: "User " + $LOG.USER_ID + " logged in.",

@@ -65,12 +65,18 @@ function filter() {
   // sudo command usage
 
   if (isSudo($LOG)) {
-    const s = parseSudoMessage($LOG.MESSAGE);
-    return {
+    const sudo = parseSudoMessage($LOG.MESSAGE);
+    const failure = !!sudo.failure;
+    const result = {
       application: "Sudo",
       category: CAT_USER_ACCESS,
-      level: WARNING,
-      message: `User ${s.caller} executed command as ${s.user}: ${s.cmd}`,
+    };
+    return {
+      ...result,
+      level: failure ? ERROR : WARNING,
+      message: failure
+        ? `User ${sudo.caller} failed to execute command as ${sudo.user}: ${sudo.cmd} (reason: ${sudo.failure})`
+        : `User ${sudo.caller} executed command as ${sudo.user}: ${sudo.cmd}`,
     };
   }
 
@@ -155,6 +161,7 @@ function isSudo(log) {
   return log &&
     log._COMM == 'sudo' &&
     log._CMDLINE &&
+    log.MESSAGE &&
     log.MESSAGE.includes("TTY") &&
     log.MESSAGE.includes("PWD") &&
     log.MESSAGE.includes("USER") &&
@@ -166,10 +173,11 @@ function isSudo(log) {
  */
 function parseSudoMessage(message) {
   const s = message.trim();
-  const regex = /^(\S+)\s*:\s*TTY=(\S+)\s*;\s*PWD=(\S+)\s*;\s*USER=(\S+)\s*;\s*COMMAND=(.+)$/
-  const [ , caller, tty, pwd, user, cmd ] = s.match(regex);
+  const regex = /^(\S+)\s*:\s*(?:([^;]+?)\s*;\s*)?TTY=(\S+)\s*;\s*PWD=(\S+)\s*;\s*USER=(\S+)\s*;\s*COMMAND=(.+)$/;
+  const [ , caller, failure, tty, pwd, user, cmd ] = s.match(regex);
   return { 
-    caller, // by whom sudo was called 
+    caller, // by whom sudo was called
+    failure, // reason for sudo failure 
     tty, // on which terminal
     pwd, // in which directory
     user, // which user sudo switched to

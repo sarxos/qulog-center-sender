@@ -481,9 +481,9 @@ class qulog implements Callable<Integer> {
 		}
 
 		private LogLevel getLogLevel(final Map<String, Object> json, final Value result) {
-			return Optional.of(optLogLevel)
-				.or(() -> getLogLevelFromResult(result))
+			return getLogLevelFromResult(result)
 				.or(() -> getLogLevelFromJournalPriority(json))
+				.or(() -> Optional.of(optLogLevel))
 				.orElse(LogLevel.INFO);
 		}
 
@@ -491,6 +491,7 @@ class qulog implements Callable<Integer> {
 			return getMember(result, "level")
 				.or(() -> getMember(result, "lvl"))
 				.or(() -> getMember(result, "l"))
+				.map(String::trim)
 				.map(String::toUpperCase)
 				.map(LogLevel::valueOf);
 		}
