@@ -136,7 +136,7 @@ journalctl -o json -f | ./qulog.java journal \
 Where:
 * `-f` is the path to the JS file containing filtering and extraction rules.
 
-# QUNAP QuLoG Center Log Receiver Configuration
+# QNAP QuLoG Center Log Receiver Configuration
 
 One need to configure QuLog Center Log Receiver to accept remote logs before attempting
 to send any. Without properly configured Log Receiver, all the syslog messages sent to the
@@ -144,22 +144,28 @@ QNAP NAS will be simply discarded and will not appear in QuLog Center.
 
 ## Log Receiver General Settings
 
+Enable Log Receiver in QuLog Center General Settings tab. 
+
 ![step-1](pictures/qulog-center-configuration-1.svg)
 
 ## Log Receiver Filter Criteria
+
+Make sure to configure Filter Criteria for Log Receiver! Without a filter criteria logs from
+sender devices will **not** be accepted and will not appear in the QuLog Center.
 
 ![step-2](pictures/qulog-center-configuration-2.svg)
 
 ## Sender Devices
 
-All the logs received from remote devices will appear under the _Sender Devices_ section
-in the left sidebar of QuLog Center menu.
+If everything is configured,
+all the logs received from remote devices will appear under the _Sender Devices_ section
+in the left sidebar of the QuLog Center menu.
 
 ![step-3](pictures/qulog-center-configuration-3.svg)
 
 # Filtering & Extraction Rules File
 
-The rules file is your plain old JavaScript file with a function which is used to filter, extract,
+The rules file is your plain old JavaScript with a function which is used to filter, extract,
 transform, and enrich event logs before sending them to QuLog Center Log Receiver.
 
 The absolute minimum requirement for the rules file is to define a funtion called `filter()`.
@@ -341,4 +347,28 @@ RFC 5424 incompatibilities were identified:
 * RFC 5424 allows the `TIMESTAMP` to contain nanoseconds, see
   [Section 6.2.3.1](https://datatracker.ietf.org/doc/html/rfc5424#section-6.2.3.1) but QuLog Center does not
   seem to accept them. All the ISO 8601 times need to be truncated to seconds.
+
+# License
+
+MIT License
+
+Copyright (c) 2025 Bartosz Firyn (sarxos)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
