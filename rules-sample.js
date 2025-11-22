@@ -90,6 +90,20 @@ function filter() {
     };
   }
 
+  if (isBackupEvent($LOG)) {
+    return {
+      application: "Backup",
+      category: CAT_SERVICES,
+    };
+  }
+
+  if (isFireholEvent($LOG)) {
+    return {
+      application: "FireHOL",
+      category: CAT_SECURITY,
+    };
+  }
+
   // Just for tests.
 
   // if ($LOG._COMM == "earlyoom") {
@@ -202,4 +216,15 @@ function isSSHFailedEvent(log) {
     log.MESSAGE.startsWith("Invalid user") ||
     log.MESSAGE.startsWith("Failed password") ||
     log.MESSAGE.startsWith("Failed publickey"));
+}
+
+function isBackupEvent(log) {
+  return log && log.SYSLOG_IDENTIFIER == 'backup.sh';
+}
+
+function isFireholEvent(log) {
+  return log && (
+    log._SYSTEMD_UNIT == 'firehol.service' ||
+    log.UNIT == 'firehol.service' ||
+    log.SYSLOG_IDENTIFIER.toLowerCase() == 'firehol');
 }
